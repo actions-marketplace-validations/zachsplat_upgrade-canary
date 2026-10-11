@@ -157,7 +157,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: zachsplat/upgrade-canary@2c5ed481cc837667301e40f239b8040a31b18cb9
+      - uses: zachsplat/upgrade-canary@3df0c83a8ee4b32feb5c9e115228e2eb866043dd
         with:
           name: app-${{ matrix.runner }}
           dockerfile: Dockerfile
