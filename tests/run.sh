@@ -155,10 +155,40 @@ t_start_modes() {
 	run start-exit-wrong 1 --image "$img" --smoke "sh -c 'exit 3'" --no-elf --sbom none
 	has start-exit-wrong "exited 3, expected 0"
 	run start-quotes 0 --image "$img" --smoke "sh -c 'echo \"two words\"'" --ready-log '^two words$' --no-elf --sbom none
+	# a smoke string that starts with --version or --help reaches the container as written
+	run start-dash-version 0 --image "$img" --entrypoint echo --smoke "--version" --ready-log '^--version$' --no-elf --sbom none
+	run start-dash-help 0 --image "$img" --entrypoint echo --smoke "--help me" --ready-log '^--help me$' --no-elf --sbom none
 	run start-db 0 --image "$img" --no-start --sbom db
 	has start-db "| Start | skip |"
 	run start-changed 4 --image "$img" --no-start --sbom db --previous "$FX/pkgdiff/old.json" --fail-on-change
 	has start-changed "PASS, but packages changed"
+}
+
+# canary.sh splits --smoke with xargs and whatever printf comes first in PATH.
+# uutils printf reads --version, --help or -- right after its format as its own
+# option where GNU printf does not, so the same line also runs against the
+# stand-in in tests/fixtures/uutils-printf.
+t_smoke_split() {
+	local line p c s want got
+	local -a cases=(
+		'--version|[--version]'
+		'--help|[--help]'
+		'--help me|[--help][me]'
+		'-- --version|[--][--version]'
+		'serve --version|[serve][--version]'
+		"sh -c 'exit 3'|[sh][-c][exit 3]"
+	)
+	line=$(grep -m 1 "mapfile -d '' smoke < <(" "$CANARY")
+	if [ -z "$line" ]; then bad "cannot find the line that splits --smoke in canary.sh"; return; fi
+	for p in host uutils-stand-in; do
+		for c in "${cases[@]}"; do
+			s=${c%%|*} want=${c#*|}
+			got=$(SMOKE=$s; [ "$p" = host ] || PATH=$FX/uutils-printf:$PATH; eval "$line"
+				printf '[%s]' ${smoke[@]+"${smoke[@]}"} | tr '\n' ' ' | cut -c 1-80)
+			if [ "$got" = "$want" ]; then ok "$p printf: --smoke \"$s\" splits into $got"
+			else bad "$p printf: --smoke \"$s\" splits into $got, expected $want"; fi
+		done
+	done
 }
 
 t_node_flip() {
@@ -176,7 +206,7 @@ t_ubuntu_flip() {
 	has ubuntu-back "#### Packages, now against the preview"
 }
 
-ALL=(pkgdiff buildlog flip_plan ok_musl missing_lib wrong_libc cachemount start_modes node_flip ubuntu_flip)
+ALL=(pkgdiff buildlog smoke_split flip_plan ok_musl missing_lib wrong_libc cachemount start_modes node_flip ubuntu_flip)
 if [ "${1:-}" = --list ]; then printf '%s\n' "${ALL[@]}"; exit 0; fi
 [ $# -gt 0 ] && ALL=("$@")
 

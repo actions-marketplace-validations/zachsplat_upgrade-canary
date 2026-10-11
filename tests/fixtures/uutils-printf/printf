@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Stand-in for uutils printf (the default printf on Ubuntu 26.04): an argument
+# right after FORMAT that is --version or --help is read as its own option,
+# and a -- there is dropped. A -- before FORMAT makes everything after it data.
+if [ "${1-}" = -- ]; then
+	shift
+else
+	case ${2-} in
+		--version) echo 'printf (uutils stand-in) 0.0.0'; exit 0 ;;
+		--help) echo 'Usage: printf FORMAT [ARGUMENT]...'; exit 0 ;;
+		--) set -- "$1" "${@:3}" ;;
+	esac
+fi
+builtin printf -- "$@"

@@ -20,7 +20,7 @@ The summary is Markdown on stdout, and is appended to `$GITHUB_STEP_SUMMARY` whe
 
 On 2026-10-06 at 13:42 UTC, Wolfi's `openssl-dev` began to resolve to `openssl-4.0-dev`. A Dockerfile that installs `openssl-dev` in a Chainguard builder stage and copies `libssl.so.3` into its runtime stage still builds without an error; the binary then cannot start.
 
-- **OpenZeppelin Relayer.** On 2026-10-10 I built `main` at d7f151f with its unmodified `Dockerfile.production`. The build exited 0. The binary exited 127: `libssl.so.4: cannot open shared object file`. The runtime stage copies only `libssl.so.3` and `libcrypto.so.3`. The fix I proposed pins `openssl-3.6-dev` ([OpenZeppelin/openzeppelin-relayer#919](https://github.com/OpenZeppelin/openzeppelin-relayer/pull/919)). The release workflow builds on a cold cache and never starts the image, so a release built from that commit would ship an image that cannot start.
+- **OpenZeppelin Relayer.** On 2026-10-10 I built `main` at d7f151f with its unmodified `Dockerfile.production`. The build exited 0. The binary exited 127: `libssl.so.4: cannot open shared object file`. The runtime stage copies only `libssl.so.3` and `libcrypto.so.3`. The fix I proposed pins `openssl-3.6-dev` ([OpenZeppelin/openzeppelin-relayer#919](https://github.com/OpenZeppelin/openzeppelin-relayer/pull/919)). The release workflow caches layers (`type=gha`), but only release builds write that cache, the last was v1.8.0 on 2026-08-19, and GitHub drops cache entries unused for 7 days, so the next release build starts cold. No step in that workflow starts the image, so a release built from that commit would ship an image that cannot start.
 - **LiteLLM.** [BerriAI/litellm#44991](https://github.com/BerriAI/litellm/pull/44991) pinned `openssl-3.6-dev` for the pgbouncer build stage on 2026-10-07. [#44997](https://github.com/BerriAI/litellm/pull/44997) reverted it 98 minutes later: with the pin, pgbouncer links `libssl.so.3`, no runtime stage installs it, and the current `wolfi-base` ships only `libssl.so.4`, so "the next digest bump makes pgbouncer exit 127 while the build stays green".
 
 Build caches make this harder to see. `RUN --mount=type=cache` keeps cargo's target directory between builds, and cargo does not relink when only a system library changes, so a rebuild on a warm builder can reuse a binary linked against the previous OpenSSL. My first rebuild of the Relayer fix did exactly that and finished in 4.7 seconds with the old binary. In my tests (BuildKit 0.12.5, 0.26.2 and 0.33.1, each on a docker-container builder) `--no-cache` did start each `RUN` with an empty cache mount, and later builds kept what that run wrote; ordinary rebuilds kept the old contents even when the step itself re-ran because something before it changed. The canary does not depend on either behaviour: every run gets a builder of its own.
@@ -32,40 +32,43 @@ Build caches make this harder to see. `RUN --mount=type=cache` keeps cargo's tar
 ### Tags that move on a date
 
 - `node:lts` becomes Node 26 on 2026-10-28. Node 26 images ship without yarn ([nodejs/docker-node#2422](https://github.com/nodejs/docker-node/pull/2422)) and without corepack, and `node:26-slim` is built on Debian 13 where `node:lts-slim` is on Debian 12. The fixture in `tests/fixtures/node-corepack` passes on today's `node:lts-slim` (Node 24.21.0) and fails in the preview with `corepack: not found`. `Dockerfile.fixed` next to it installs corepack from npm and passes on both.
-- The Docker tag `ubuntu:latest` already has the same digest as `ubuntu:26.04` (checked 2026-10-11), so the preview reports it as the same image and builds nothing. An image still pinned to the previous release can preview the move with `--flip ubuntu:24.04=ubuntu:26.04`: on the Ubuntu fixture both builds pass, and curl goes from 8.5.0 to 8.18.0 and OpenSSL from 3.0.13 to 3.5.5 among 124 changed, 30 added and 4 removed packages. The GitHub runner label `ubuntu-latest` moves to Ubuntu 26.04 between 2026-10-19 and 2026-11-19 ([actions/runner-images#14748](https://github.com/actions/runner-images/issues/14748)); a container cannot preview that, so the example workflow below runs on `ubuntu-26.04` as well.
+- The Docker tag `ubuntu:latest` already has the same digest as `ubuntu:26.04` (checked 2026-10-11), so the preview reports it as the same image and builds nothing. An image still pinned to the previous release can preview the move with `--flip ubuntu:24.04=ubuntu:26.04`: on a copy of the Ubuntu fixture with `FROM ubuntu:24.04`, both builds pass, and curl goes from 8.5.0 to 8.18.0 and OpenSSL from 3.0.13 to 3.5.5 among 124 changed, 30 added and 4 removed packages. The GitHub runner label `ubuntu-latest` moves to Ubuntu 26.04 between 2026-10-19 and 2026-11-19 ([actions/runner-images#14748](https://github.com/actions/runner-images/issues/14748)); a container cannot preview that, so the example workflow below runs on `ubuntu-26.04` as well.
 - `python:3` still points at 3.14 (3.14.8). Python 3.15.0 was released on 2026-10-09 and on 2026-10-11 there was no `python:3.15` tag yet, so the preview uses `python:3.15-rc`, which still carries 3.15.0rc3.
 
 ## Usage
 
 ```sh
-./canary.sh [options] [CONTEXT]
+~/upgrade-canary/canary.sh [options] [CONTEXT]
 ```
+
+The examples run the script from a clone of this repository at `~/upgrade-canary` (`git clone https://github.com/zachsplat/upgrade-canary ~/upgrade-canary`), in the directory that holds your Dockerfile. Call it by that path: it finds `lib/` next to itself (a symlink to it from another directory does not), and it writes `.canary/` in the directory you run it from.
 
 Build the current directory's `Dockerfile`, check libraries, check that the default command does not crash in its first 10 seconds:
 
 ```sh
-./canary.sh .
+~/upgrade-canary/canary.sh .
 ```
 
 A service with a health URL and a preview on the next base tags:
 
 ```sh
-./canary.sh --ready-url http://localhost:3000/health --flip-preview tests/fixtures/node-corepack
+~/upgrade-canary/canary.sh --ready-url http://localhost:3000/health --flip-preview \
+  ~/upgrade-canary/tests/fixtures/node-corepack
 ```
 
 A service that needs other containers. The compose file uses `image: ${CANARY_IMAGE}` for the service under test (see `examples/openzeppelin-relayer`):
 
 ```sh
-./canary.sh -f Dockerfile.production \
-  --compose /path/to/canary/examples/openzeppelin-relayer/compose.yml --service relayer \
+~/upgrade-canary/canary.sh -f Dockerfile.production \
+  --compose ~/upgrade-canary/examples/openzeppelin-relayer/compose.yml --service relayer \
   --ready-url http://localhost:8080/api/v1/health --timeout 120 .
 ```
 
 A command that must exit 0, and an image that is already built or published:
 
 ```sh
-./canary.sh --smoke "--version" .
-./canary.sh --image openzeppelin/openzeppelin-relayer:v1.8.0 --no-start
+~/upgrade-canary/canary.sh --smoke "--version" .
+~/upgrade-canary/canary.sh --image openzeppelin/openzeppelin-relayer:v1.8.0 --no-start
 ```
 
 This is the summary for the Relayer at d7f151f on 2026-10-11, abridged (paths and the package source line removed). The previous package list it diffs against came from a run of the pinned branch (30b32b1) a few minutes earlier:
@@ -110,10 +113,10 @@ Run again at 19:20 UTC the same day, the pinned branch still passed, and its dif
 Only print what the preview would substitute:
 
 ```sh
-./canary.sh --flip-plan -f Dockerfile .
+~/upgrade-canary/canary.sh --flip-plan -f Dockerfile .
 ```
 
-`./canary.sh --help` lists every option. The ones you will want most:
+`~/upgrade-canary/canary.sh --help` lists every option. The ones you will want most:
 
 | Option | What it does |
 |---|---|
@@ -128,11 +131,11 @@ Only print what the preview would substitute:
 
 Exit status: 0 pass, 1 a check failed, 2 usage or setup error, 3 the preview failed while the current build passed, 4 packages changed (with `--fail-on-change`).
 
-Each run writes `.canary/runs/<run>/` (the summary, the build log, the library scan, the start log, the package lists and the diffs as JSON) and, when the current build passes, `.canary/last-green.json` for the next run to diff against.
+Each run writes `.canary/runs/<run>/` (the summary, the build log, the library scan, the start log, the package lists and the diffs as JSON) and, when the current build passes, `.canary/last-green.json` for the next run to diff against. The built image stays in Docker as `canary/<name>:<run>` (`-flip` appended for the preview, or your `--tag`) and old run directories are kept, so a machine that runs this on a schedule gains one image per run (two with the preview). They are tagged, so `docker image prune` without `-a` leaves them; remove them with `docker image ls --format '{{.Repository}}:{{.Tag}}' 'canary/*' | xargs -r docker rmi`, and clear `.canary/runs/` now and then. With a fixed `--tag`, each run untags the previous image instead, and `docker image prune` does remove those.
 
 ## GitHub Action
 
-`action.yml` wraps the CLI. It restores the last green package list from the Actions cache, runs the checks, saves the list again and uploads the run directory as an artifact. Until this has a repository of its own, copy this directory to `.github/actions/canary` in your repository.
+`action.yml` wraps the CLI. It restores the last green package list from the Actions cache, runs the checks, saves the list again and uploads the run directory as an artifact. The example pins it to a commit of this repository; `zachsplat/upgrade-canary@main` also works and follows every change I push to `main`. A copy of this repository under `.github/actions/canary` in yours, referenced by that path, works too.
 
 ```yaml
 name: upgrade canary
@@ -154,7 +157,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/canary
+      - uses: zachsplat/upgrade-canary@2c5ed481cc837667301e40f239b8040a31b18cb9
         with:
           name: app-${{ matrix.runner }}
           dockerfile: Dockerfile
@@ -167,7 +170,7 @@ Inputs mirror the CLI options (`dockerfile`, `context`, `target`, `build-args` o
 
 ## Requirements
 
-Linux, Docker with buildx and the docker-container driver, bash 4.4 or later, jq, awk, xargs and coreutils. syft runs from its own image (`ghcr.io/anchore/syft`, pinned by digest) and needs the local Docker socket; the scan helper is `busybox:1.38.0-musl`, also pinned by digest.
+Linux, Docker with buildx 0.13 or later and the docker-container driver (and the Docker Compose plugin for `--compose`), bash 4.4 or later, jq, awk, xargs and coreutils. syft runs from its own image (`ghcr.io/anchore/syft`, pinned by digest) and needs the local Docker socket; the scan helper is `busybox:1.38.0-musl`, also pinned by digest.
 
 ## Limits
 
@@ -184,10 +187,10 @@ Linux, Docker with buildx and the docker-container driver, bash 4.4 or later, jq
 
 ## Tests
 
-`tests/run.sh` builds the fixtures in `tests/fixtures` and checks the verdicts: a passing Alpine image, a binary copied without its library (glibc and musl), a musl binary in a glibc image, the cache mount behaviour, every start check mode, the package diff and build log parsers, the flip planner, and the node and ubuntu previews. `tests/run.sh --list` names them; pass names to run a subset.
+`tests/run.sh` builds the fixtures in `tests/fixtures` and checks the verdicts: a passing Alpine image, a binary copied without its library (glibc and musl), a musl binary in a glibc image, the cache mount behaviour, every start check mode, how `--smoke` is split into words, the package diff and build log parsers, the flip planner, and the node and ubuntu previews. `tests/run.sh --list` names them; pass names to run a subset.
 
 ## License
 
 MIT, see `LICENSE`.
 
-If you would rather I run it on a schedule for you and send the fix as a pull request: $99 per image a month, or $299 for five. https://nonceworks.com
+If you would rather I run it on a schedule for you and send the fix as a pull request: $99 per image a month, or $299 for five. Write to hello@nonceworks.com.

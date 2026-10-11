@@ -426,8 +426,9 @@ start_check() {
 	fi
 	echo "$mode" >"$dir/start.mode"
 	if [ "$SMOKE_SET" = 1 ] && [ -n "$SMOKE" ]; then
-		# split like a shell would, without evaluating anything
-		mapfile -d '' smoke < <(printf '%s' "$SMOKE" | xargs printf '%s\0')
+		# split like a shell would, without evaluating anything; the -- keeps
+		# uutils printf from reading a leading --help or --version as an option
+		mapfile -d '' smoke < <(printf '%s' "$SMOKE" | xargs printf -- '%s\0')
 	fi
 	if [ -n "$COMPOSE" ]; then
 		proj=$(printf '%s' "${PROJECT:-$PREFIX-$RUN_ID}-$label" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-')
