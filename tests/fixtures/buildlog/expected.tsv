@@ -1,0 +1,12 @@
+base	stage-1	image	cgr.dev/chainguard/wolfi-base	sha256:0a8fd427de5882aed77471b0a432c3675eda6b6a0ae952b5d640b46da628cdbe
+base	base	image	cgr.dev/chainguard/rust:latest-dev	sha256:63fe36977879f68bb449c681f1e1e3a60d7368ec2b7a67f21fae3737fe7cc3a4
+build	base	apk	libsodium	1.0.22-r2
+build	base	apk	openssl-4.0-libcrypto	4.0.3-r6
+build	base	apk	openssl-4.0-dev	4.0.3-r6
+build	stage-1	apk	nodejs-20	20.19.6-r0
+build	stage-1	apk	npm-12	12.2.0-r2
+build		deb	libssl3t64	3.0.13-0ubuntu3.5
+build		deb	curl	8.5.0-2ubuntu10.6
+build		python	charset-normalizer	3.3.2
+build		python	requests	2.31.0
+build		apk	libcrypto3	3.3.2-r0

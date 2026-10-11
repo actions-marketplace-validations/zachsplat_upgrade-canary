@@ -1,0 +1,13 @@
+name: test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run the fixtures through canary.sh
+        run: tests/run.sh

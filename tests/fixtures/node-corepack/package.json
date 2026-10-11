@@ -1,0 +1,7 @@
+{
+  "name": "canary-node-fixture",
+  "private": true,
+  "version": "1.0.0",
+  "packageManager": "pnpm@10.34.6",
+  "dependencies": {}
+}

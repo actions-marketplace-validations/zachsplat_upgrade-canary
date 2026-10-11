@@ -1,0 +1,17 @@
+# Start check for an OpenZeppelin Relayer image. Redis plus a config with one
+# network and no relayers is enough for /api/v1/health to answer 200. No host
+# ports: canary.sh fetches the URL from inside the relayer's network namespace.
+#
+#   canary.sh -f Dockerfile.production --compose compose.yml --service relayer \
+#     --ready-url http://localhost:8080/api/v1/health --timeout 90 .
+services:
+  redis:
+    image: redis:7.2
+  relayer:
+    image: ${CANARY_IMAGE}
+    depends_on: [redis]
+    environment:
+      REDIS_URL: redis://redis:6379
+      API_KEY: canary-start-check-api-key-0123456789abcdef
+    volumes:
+      - ./config:/app/config:ro

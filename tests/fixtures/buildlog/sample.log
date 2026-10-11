@@ -1,0 +1,24 @@
+#0 building with "example" instance using docker-container driver
+
+#3 [internal] load metadata for cgr.dev/chainguard/rust:latest-dev@sha256:63fe36977879f68bb449c681f1e1e3a60d7368ec2b7a67f21fae3737fe7cc3a4
+#3 DONE 1.2s
+
+#7 [stage-1  1/11] FROM cgr.dev/chainguard/wolfi-base@sha256:0a8fd427de5882aed77471b0a432c3675eda6b6a0ae952b5d640b46da628cdbe
+#7 resolve cgr.dev/chainguard/wolfi-base@sha256:0a8fd427de5882aed77471b0a432c3675eda6b6a0ae952b5d640b46da628cdbe done
+#8 [base 1/5] FROM cgr.dev/chainguard/rust:latest-dev@sha256:63fe36977879f68bb449c681f1e1e3a60d7368ec2b7a67f21fae3737fe7cc3a4
+#10 [base 2/5] RUN apk update && apk --no-cache add     openssl-dev     perl     libsodium-dev
+#10 5.886 (1/9) Installing libsodium (1.0.22-r2)
+#10 7.331 (5/9) Installing openssl-4.0-libcrypto (4.0.3-r6)
+#10 7.954 (7/9) Installing openssl-4.0-dev (4.0.3-r6)
+#10 DONE 9.7s
+#13 [base 5/5] RUN cargo install --root /usr/app --path . --locked
+#13 0.079   Installing openzeppelin-relayer v1.8.0 (/usr/app)
+#17 [stage-1  6/11] RUN apk add --no-cache nodejs=~20.19 npm
+#17 4.025 (10/12) Installing nodejs-20 (20.19.6-r0)
+#17 4.942 (12/12) Installing npm-12 (12.2.0-r2)
+#21 [3/4] RUN apt-get update && apt-get install -y curl
+#21 3.210 Setting up libssl3t64:amd64 (3.0.13-0ubuntu3.5) ...
+#21 3.399 Setting up curl (8.5.0-2ubuntu10.6) ...
+#22 [4/4] RUN pip install requests && apk upgrade
+#22 4.100 Successfully installed charset-normalizer-3.3.2 requests-2.31.0
+#22 5.000 (1/1) Upgrading libcrypto3 (3.3.1-r0 -> 3.3.2-r0)

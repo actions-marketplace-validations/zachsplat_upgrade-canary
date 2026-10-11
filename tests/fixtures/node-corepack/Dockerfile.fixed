@@ -1,0 +1,9 @@
+# The same image with corepack installed from npm, so it does not depend on
+# the copy that Node images up to 24 bundle.
+FROM node:lts-slim
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+WORKDIR /app
+COPY package.json index.js ./
+RUN npm install -g corepack@0.36.0 && corepack enable && pnpm install
+EXPOSE 3000
+CMD ["node", "index.js"]

@@ -1,0 +1,33 @@
+name: self-check
+on:
+  push:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+jobs:
+  node-fixed:
+    # corepack installed from npm: passes on node:lts today and on node:26
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        with:
+          name: node-corepack-fixed
+          context: tests/fixtures/node-corepack
+          dockerfile: tests/fixtures/node-corepack/Dockerfile.fixed
+          ready-url: http://localhost:3000/health
+          flip-preview: "true"
+  node-flip-warning:
+    # relies on the corepack that Node images up to 24 bundle: passes today,
+    # reported (not failed) in the node:26 preview
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        with:
+          name: node-corepack-flip
+          context: tests/fixtures/node-corepack
+          dockerfile: tests/fixtures/node-corepack/Dockerfile
+          ready-url: http://localhost:3000/health
+          flip-preview: "true"
+          flip-warn-only: "true"

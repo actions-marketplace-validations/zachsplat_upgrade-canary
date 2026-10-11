@@ -1,0 +1,197 @@
+name: Upgrade canary
+description: >-
+  Clean build of a Dockerfile on a builder created for the run, a check that
+  every ELF file in the image can load its libraries, a start check, a package
+  diff against the last green run, and a preview build on the next value of
+  floating base image tags.
+author: Zachary Alexander
+branding:
+  icon: alert-triangle
+  color: yellow
+
+inputs:
+  dockerfile:
+    description: Path to the Dockerfile.
+    default: Dockerfile
+  context:
+    description: Build context.
+    default: .
+  target:
+    description: Build stage to build.
+    default: ""
+  build-args:
+    description: Build arguments, one KEY=VALUE per line.
+    default: ""
+  image:
+    description: Check this existing image instead of building one.
+    default: ""
+  elf-paths:
+    description: Space-separated paths inside the image to look for ELF files in.
+    default: /
+  elf-exclude:
+    description: Extended regex of paths to skip in the library check.
+    default: ""
+  strict-libs:
+    description: Also fail on shared objects (plugins, extension modules) with unresolved libraries.
+    default: "false"
+  smoke:
+    description: Arguments to run the image with (the entrypoint is kept). Without a ready check, the exit code decides.
+    default: ""
+  entrypoint:
+    description: Entrypoint override for the start check.
+    default: ""
+  expect-exit:
+    description: Exit code the smoke command must return.
+    default: "0"
+  ready-log:
+    description: Extended regex; the image is ready when a log line matches.
+    default: ""
+  ready-url:
+    description: URL that must answer 2xx, fetched from inside the container's network namespace.
+    default: ""
+  run-args:
+    description: Extra docker run arguments, one per line.
+    default: ""
+  compose:
+    description: Compose file to start instead of a single container; the service under test uses image ${CANARY_IMAGE}.
+    default: ""
+  service:
+    description: Compose service to check.
+    default: ""
+  timeout:
+    description: Seconds the start check may take.
+    default: "60"
+  settle:
+    description: With no smoke or ready option, seconds the default command must keep running.
+    default: "10"
+  sbom:
+    description: Runtime package list from syft, from the image's package database (db), or none.
+    default: syft
+  flip-preview:
+    description: Also build a copy with node:lts, ubuntu:latest and python:3 base tags moved to their next value.
+    default: "false"
+  flips:
+    description: Your own FROM=TO substitutions for the preview, one per line.
+    default: ""
+  flip-warn-only:
+    description: Do not fail the job when only the preview fails.
+    default: "false"
+  fail-on-change:
+    description: Fail the job when packages changed since the last green run.
+    default: "false"
+  registry-mirror:
+    description: Pull Docker Hub images through this mirror, for example mirror.gcr.io.
+    default: ""
+  cpus:
+    description: CPU limit for the build.
+    default: ""
+  name:
+    description: Label for the summary, the cache key and the artifact. Set it when one job checks several images.
+    default: ""
+  upload-artifact:
+    description: Upload the run directory (summary, logs, package lists) as an artifact.
+    default: "true"
+
+outputs:
+  result:
+    description: pass, fail, flip-fail or changed.
+    value: ${{ steps.canary.outputs.result }}
+  summary:
+    description: Path of the Markdown summary.
+    value: ${{ steps.canary.outputs.summary }}
+  image:
+    description: The image that was checked.
+    value: ${{ steps.canary.outputs.image }}
+  changed:
+    description: Number of package changes since the last green run.
+    value: ${{ steps.canary.outputs.changed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Restore the last green package list
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ runner.temp }}/canary-state/last-green.json
+        key: canary-${{ inputs.name || inputs.dockerfile }}--${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: canary-${{ inputs.name || inputs.dockerfile }}--
+
+    - name: Run the canary
+      id: canary
+      shell: bash
+      env:
+        IN_DOCKERFILE: ${{ inputs.dockerfile }}
+        IN_CONTEXT: ${{ inputs.context }}
+        IN_TARGET: ${{ inputs.target }}
+        IN_BUILD_ARGS: ${{ inputs.build-args }}
+        IN_IMAGE: ${{ inputs.image }}
+        IN_ELF_PATHS: ${{ inputs.elf-paths }}
+        IN_ELF_EXCLUDE: ${{ inputs.elf-exclude }}
+        IN_STRICT_LIBS: ${{ inputs.strict-libs }}
+        IN_SMOKE: ${{ inputs.smoke }}
+        IN_ENTRYPOINT: ${{ inputs.entrypoint }}
+        IN_EXPECT_EXIT: ${{ inputs.expect-exit }}
+        IN_READY_LOG: ${{ inputs.ready-log }}
+        IN_READY_URL: ${{ inputs.ready-url }}
+        IN_RUN_ARGS: ${{ inputs.run-args }}
+        IN_COMPOSE: ${{ inputs.compose }}
+        IN_SERVICE: ${{ inputs.service }}
+        IN_TIMEOUT: ${{ inputs.timeout }}
+        IN_SETTLE: ${{ inputs.settle }}
+        IN_SBOM: ${{ inputs.sbom }}
+        IN_FLIP_PREVIEW: ${{ inputs.flip-preview }}
+        IN_FLIPS: ${{ inputs.flips }}
+        IN_FLIP_WARN_ONLY: ${{ inputs.flip-warn-only }}
+        IN_FAIL_ON_CHANGE: ${{ inputs.fail-on-change }}
+        IN_REGISTRY_MIRROR: ${{ inputs.registry-mirror }}
+        IN_CPUS: ${{ inputs.cpus }}
+        IN_NAME: ${{ inputs.name }}
+      run: |
+        args=(--state-dir "$RUNNER_TEMP/canary-state")
+        add() { if [ -n "$2" ]; then args+=("$1" "$2"); fi; }
+        flag() { if [ "$2" = true ]; then args+=("$1"); fi; }
+        lines() { while IFS= read -r line; do if [ -n "$line" ]; then args+=("$1" "$line"); fi; done <<< "$2"; }
+        if [ -n "$IN_IMAGE" ]; then
+          args+=(--image "$IN_IMAGE")
+          if [ "$IN_FLIP_PREVIEW" = true ]; then args+=(-f "$IN_DOCKERFILE"); fi
+        else
+          args+=(-f "$IN_DOCKERFILE")
+        fi
+        add --target "$IN_TARGET"
+        lines --build-arg "$IN_BUILD_ARGS"
+        args+=(--elf-paths "$IN_ELF_PATHS")
+        add --elf-exclude "$IN_ELF_EXCLUDE"
+        flag --strict-libs "$IN_STRICT_LIBS"
+        add --smoke "$IN_SMOKE"
+        add --entrypoint "$IN_ENTRYPOINT"
+        args+=(--expect-exit "$IN_EXPECT_EXIT")
+        add --ready-log "$IN_READY_LOG"
+        add --ready-url "$IN_READY_URL"
+        lines --run-arg "$IN_RUN_ARGS"
+        add --compose "$IN_COMPOSE"
+        add --service "$IN_SERVICE"
+        args+=(--timeout "$IN_TIMEOUT" --settle "$IN_SETTLE" --sbom "$IN_SBOM")
+        flag --flip-preview "$IN_FLIP_PREVIEW"
+        lines --flip "$IN_FLIPS"
+        flag --flip-warn-only "$IN_FLIP_WARN_ONLY"
+        flag --fail-on-change "$IN_FAIL_ON_CHANGE"
+        add --registry-mirror "$IN_REGISTRY_MIRROR"
+        add --cpus "$IN_CPUS"
+        add --name "$IN_NAME"
+        if [ -z "$IN_IMAGE" ]; then args+=("$IN_CONTEXT"); fi
+        "$GITHUB_ACTION_PATH/canary.sh" "${args[@]}"
+
+    - name: Save the package list for the next run
+      if: always() && steps.canary.outputs.last-green != ''
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ runner.temp }}/canary-state/last-green.json
+        key: canary-${{ inputs.name || inputs.dockerfile }}--${{ github.run_id }}-${{ github.run_attempt }}
+
+    - name: Upload the run directory
+      if: always() && inputs.upload-artifact == 'true' && steps.canary.outputs.run-dir != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: canary-${{ steps.canary.outputs.slug }}-${{ github.run_attempt }}
+        path: ${{ steps.canary.outputs.run-dir }}
+        retention-days: 14
