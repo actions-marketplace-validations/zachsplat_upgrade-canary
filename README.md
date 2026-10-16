@@ -25,6 +25,17 @@ On 2026-10-06 at 13:42 UTC, Wolfi's `openssl-dev` began to resolve to `openssl-4
 
 Build caches make this harder to see. `RUN --mount=type=cache` keeps cargo's target directory between builds, and cargo does not relink when only a system library changes, so a rebuild on a warm builder can reuse a binary linked against the previous OpenSSL. My first rebuild of the Relayer fix did exactly that and finished in 4.7 seconds with the old binary. In my tests (BuildKit 0.12.5, 0.26.2 and 0.33.1, each on a docker-container builder) `--no-cache` did start each `RUN` with an empty cache mount, and later builds kept what that run wrote; ordinary rebuilds kept the old contents even when the step itself re-ran because something before it changed. The canary does not depend on either behaviour: every run gets a builder of its own.
 
+### A published image whose JavaScript scripts cannot run (October 2026)
+
+`openzeppelin/openzeppelin-monitor:v1.6.0` starts, and `--help` exits 0, so a start check alone passes. The library check does not: run against the published image on 2026-10-11, it failed 2 of the image's 153 ELF files, and noted a third, the shared object `/usr/lib/libjq.so.1.0.4`, with the same missing symbol version. `/usr/bin/node` and `/usr/bin/jq` need `libm.so.6(GLIBC_2.43)`, and the image's runtime base pins `glibc 2.42-r7`. Monitor runs JavaScript trigger scripts and conditions through `node`, so in this image they error out, and a JavaScript trigger condition passes every match on unfiltered. I reported it with a tested fix (a current `wolfi-base` digest) as [OpenZeppelin/openzeppelin-monitor#502](https://github.com/OpenZeppelin/openzeppelin-monitor/issues/502). From that run's summary:
+
+| Check | Result | Detail |
+|---|---|---|
+| Clean build | skip | existing image openzeppelin/openzeppelin-monitor:v1.6.0 |
+| Shared libraries | **FAIL** | 2 of 153 ELF files cannot load |
+| Start | pass | exited 0 |
+| Packages | info | 801 entries listed; no previous list to compare |
+
 ### pnpm 12
 
 `npm install -g pnpm` now installs pnpm 12. The Relayer's `main` pins `pnpm@10` with the comment "pnpm 12 ships a preinstall script that newer npm blocks by default, which leaves a broken pnpm shim". When I built the branch of OpenZeppelin/openzeppelin-relayer#862 on 2026-10-10, which predates that pin, `pnpm install` failed with `ERR_PNPM_IGNORED_BUILDS` on esbuild until I pinned `pnpm@10`. Nothing in the branch had changed; the package manager had. A scheduled clean build shows this on the day it happens, and the package diff names the version that moved when the build still passes.
