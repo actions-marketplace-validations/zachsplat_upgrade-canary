@@ -1,9 +1,5 @@
 name: Upgrade canary
-description: >-
-  Clean build of a Dockerfile on a builder created for the run, a check that
-  every ELF file in the image can load its libraries, a start check, a package
-  diff against the last green run, and a preview build on the next value of
-  floating base image tags.
+description: "Catch broken Docker images before release: clean build, ELF library check, start check, package diff, next base tag preview."
 author: Zachary Alexander
 branding:
   icon: alert-triangle
