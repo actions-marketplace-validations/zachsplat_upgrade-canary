@@ -8,7 +8,7 @@
 
 set -uo pipefail
 
-CANARY_VERSION=0.1.0
+CANARY_VERSION=1.0.1
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LIB=$HERE/lib
 
@@ -83,7 +83,8 @@ Flip preview
                            to ubuntu:26.04, python:3 to the newest 3.x tag
   --flip FROM=TO           your own substitution, repeatable (implies
                            --flip-preview); overrides the built-in ones
-  --flip-plan              print the substitutions and exit
+  --flip-plan              print the substitutions and exit (2 when a registry
+                           lookup failed)
   --flip-warn-only         exit 0 when only the preview fails
 
 Other
@@ -91,8 +92,9 @@ Other
   --keep-work              keep the temporary directory
   -h, --help, --version
 
-Exit status: 0 pass, 1 a check failed, 2 usage or setup error, 3 the preview
-failed while the current build passed, 4 packages changed (--fail-on-change).
+Exit status: 0 pass, 1 a check failed, 2 usage or setup error (also when a
+registry lookup for the flip preview fails), 3 the preview failed while the
+current build passed, 4 packages changed (--fail-on-change).
 EOF
 }
 
@@ -603,50 +605,130 @@ lookup_ref() {
 	printf '%s' "$r"
 }
 
-# Registry lookups are cached; callers read REG_OUT (no subshell, so the cache
-# survives).
-declare -A REG_DIGEST=()
+# A failed lookup gets a hint for what usually fixes it.
+lookup_hint() {
+	case ${1,,} in
+		*429*|*toomanyrequests*|*'too many requests'*)
+			if [ -n "$MIRROR" ]; then
+				printf '%s (rate limited; run again later or log in)' "$1"
+			else
+				printf '%s (rate limited; log in with docker login, or pass --registry-mirror mirror.gcr.io for Docker Hub images)' "$1"
+			fi ;;
+		*401*|*403*|*unauthorized*|*denied*|*authorize*) printf '%s (log in to that registry with docker login)' "$1" ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+# Registry lookups go through imagetools and are cached; callers read REG_OUT,
+# REG_STATE and REG_ERR (no subshell, so the cache survives). REG_STATE is ok,
+# missing (the registry says the reference does not exist) or error (anything
+# else: a rate limit, a login error, a network error), with the message in
+# REG_ERR. Only missing may be read as "this tag does not exist".
+declare -A REG_CACHE=() REG_CACHE_STATE=() REG_CACHE_ERR=()
 REG_OUT=
-registry_digest() {
-	local ref=$1
-	if [ -z "${REG_DIGEST[$ref]+set}" ]; then
-		REG_DIGEST[$ref]=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$(lookup_ref "$ref")" 2>/dev/null | jq -r '.digest // empty' 2>/dev/null)
+REG_STATE=
+REG_ERR=
+registry_inspect() {
+	local ref=$1 what=$2 key="$2 $1" out rc err
+	if [ -z "${REG_CACHE_STATE[$key]+set}" ]; then
+		out=$(docker buildx imagetools inspect --format "{{json .$what}}" "$(lookup_ref "$ref")" 2>"$WORK/imagetools.err")
+		rc=$?
+		err=$(sed -n 's/^ERROR: //p' "$WORK/imagetools.err" | head -n 1)
+		[ -n "$err" ] || err=$(grep -v '^[[:space:]]*$' "$WORK/imagetools.err" | tail -n 1)
+		err=$(printf '%s' "$err" | tr '\t\r' '  ' | cut -c 1-300)
+		if [ "$rc" = 0 ] && [ -n "$out" ]; then
+			REG_CACHE[$key]=$out
+			REG_CACHE_STATE[$key]=ok
+			REG_CACHE_ERR[$key]=
+		elif printf '%s' "$err" | grep -qiE ': not found$|manifest unknown|name unknown'; then
+			REG_CACHE[$key]=
+			REG_CACHE_STATE[$key]=missing
+			REG_CACHE_ERR[$key]=
+		else
+			REG_CACHE[$key]=
+			REG_CACHE_STATE[$key]=error
+			REG_CACHE_ERR[$key]=$(lookup_hint "${err:-docker buildx imagetools inspect exited $rc}")
+		fi
 	fi
-	REG_OUT=${REG_DIGEST[$ref]}
+	REG_OUT=${REG_CACHE[$key]}
+	REG_STATE=${REG_CACHE_STATE[$key]}
+	REG_ERR=${REG_CACHE_ERR[$key]}
 }
-tag_exists() { registry_digest "$1"; [ -n "$REG_OUT" ]; }
 
-python_minor() {
-	docker buildx imagetools inspect --format '{{json .Image}}' "$(lookup_ref "$1")" 2>/dev/null | jq -r --arg p "$HOST_PLATFORM" '
+registry_digest() {
+	registry_inspect "$1" Manifest
+	[ "$REG_STATE" = ok ] || return 0
+	REG_OUT=$(printf '%s' "$REG_OUT" | jq -r '.digest // empty' 2>/dev/null)
+	if [ -z "$REG_OUT" ]; then
+		REG_STATE=error
+		REG_ERR="the registry answer for $1 has no digest"
+	fi
+}
+
+# PYTHON_VERSION in the image config of a python reference, for this host's
+# platform; REG_OUT is empty when the image does not set it.
+python_version() {
+	registry_inspect "$1" Image
+	[ "$REG_STATE" = ok ] || { REG_OUT=; return 0; }
+	REG_OUT=$(printf '%s' "$REG_OUT" | jq -r --arg p "$HOST_PLATFORM" '
 		(if has("config") then . else (.[$p] // (to_entries[0].value)) end)
-		| .config.Env[]? | select(startswith("PYTHON_VERSION=")) | ltrimstr("PYTHON_VERSION=") | split(".")[1]' 2>/dev/null | head -n 1
+		| .config.Env[]? | select(startswith("PYTHON_VERSION=")) | ltrimstr("PYTHON_VERSION=")' 2>/dev/null | head -n 1)
 }
 
-# Results of the flip rules: FLIP_TO (target reference) and FLIP_NOTE.
+# Results of the flip rules: FLIP_TO (target reference) and FLIP_NOTE, or
+# FLIP_ERR when a registry lookup failed.
 FLIP_TO=
 FLIP_NOTE=
+FLIP_ERR=
 
-# Newest python:3.N tag for a variant suffix ("" or "-slim" and so on); falls
-# back to the 3.(N+1)-rc tag when the next minor is not tagged yet.
+# Newest python:3.N tag for a variant suffix ("" or "-slim" and so on). When
+# the next minor is not tagged yet, its 3.(N+1)-rc tag is used only once it
+# carries a release candidate: before that it holds an alpha or a beta, which
+# few packages publish wheels for.
 python_next() {
-	local sfx=$1 cur n
-	cur=$(python_minor "python:3$sfx")
-	if ! [[ $cur =~ ^[0-9]+$ ]]; then
+	local sfx=$1 cur minor n rc
+	python_version "python:3$sfx"
+	if [ "$REG_STATE" = error ]; then
+		FLIP_ERR="python:3$sfx: $REG_ERR"
+		return 1
+	fi
+	cur=$REG_OUT
+	minor=$(printf '%s' "$cur" | cut -d. -f2)
+	if ! [[ $minor =~ ^[0-9]+$ ]]; then
 		FLIP_NOTE="could not read the Python version of python:3$sfx"
 		return 1
 	fi
-	n=$cur
-	while tag_exists "python:3.$((n + 1))$sfx"; do n=$((n + 1)); done
-	if [ "$n" -gt "$cur" ]; then
+	n=$minor
+	while :; do
+		registry_digest "python:3.$((n + 1))$sfx"
+		case $REG_STATE in
+			ok) n=$((n + 1)) ;;
+			missing) break ;;
+			*) FLIP_ERR="python:3.$((n + 1))$sfx: $REG_ERR"; return 1 ;;
+		esac
+	done
+	if [ "$n" -gt "$minor" ]; then
 		FLIP_TO="python:3.$n$sfx"
 		return 0
 	fi
-	if tag_exists "python:3.$((n + 1))-rc$sfx"; then
-		FLIP_NOTE="python:3.$((n + 1))$sfx is not tagged yet; using the release candidate tag"
-		FLIP_TO="python:3.$((n + 1))-rc$sfx"
-		return 0
-	fi
-	FLIP_NOTE="python:3$sfx is already the newest 3.x (3.$cur)"
+	rc="python:3.$((n + 1))-rc$sfx"
+	python_version "$rc"
+	case $REG_STATE in
+		error)
+			FLIP_ERR="$rc: $REG_ERR"
+			return 1 ;;
+		ok)
+			if [[ $REG_OUT == *rc* ]]; then
+				FLIP_TO=$rc
+				FLIP_NOTE="python:3.$((n + 1))$sfx is not tagged yet; using the release candidate tag ($REG_OUT)"
+				return 0
+			fi
+			if [ -n "$REG_OUT" ]; then
+				FLIP_NOTE="python:3$sfx is the newest 3.x release ($cur); $rc holds $REG_OUT, not a release candidate yet"
+				return 1
+			fi ;;
+	esac
+	FLIP_NOTE="python:3$sfx is already the newest 3.x ($cur)"
 	return 1
 }
 
@@ -665,6 +747,7 @@ builtin_flip() {
 	local repo=$1 tag=$2
 	FLIP_TO=
 	FLIP_NOTE=
+	FLIP_ERR=
 	case $repo in
 		node)
 			case $tag in
@@ -708,7 +791,8 @@ custom_flip() {
 
 # Writes flip-plan.tsv: line, FROM reference, preview reference, status, note.
 # status: flip, same (already the same image), missing (target tag not found),
-# skip (stage, scratch, build argument or digest pin), none (no rule).
+# error (a registry lookup failed), skip (stage, scratch, build argument or
+# digest pin), none (no rule).
 plan_flips() {
 	local df=$1 plan=$2 ln=0 line ref to note status cur new i
 	local -a tok=()
@@ -737,6 +821,8 @@ plan_flips() {
 				status=skip note="pinned by digest; the tag moving does not reach it"
 			elif builtin_flip "$REF_REPO" "$REF_TAG"; then
 				status=flip to=$FLIP_TO note=$FLIP_NOTE
+			elif [ -n "$FLIP_ERR" ]; then
+				status=error note=$FLIP_ERR
 			else
 				status=none note=$FLIP_NOTE
 			fi
@@ -745,26 +831,37 @@ plan_flips() {
 			stages[${tok[$((i + 2))],,}]=1
 		fi
 		if [ "$status" = flip ]; then
-			registry_digest "$ref"
-			cur=$REG_OUT
 			registry_digest "$to"
 			new=$REG_OUT
-			if [ -z "$new" ] && [[ $to =~ -alpine3\.[0-9]+ ]]; then
+			if [ "$REG_STATE" = missing ] && [[ $to =~ -alpine3\.[0-9]+ ]]; then
 				# a variant pinned to an Alpine release the new tag line does not have
 				local alt=${to/${BASH_REMATCH[0]}/-alpine}
 				registry_digest "$alt"
-				if [ -n "$REG_OUT" ]; then
-					note="$to does not exist; using $alt${note:+; $note}"
-					to=$alt
-					new=$REG_OUT
-				fi
+				case $REG_STATE in
+					ok)
+						note="$to does not exist; using $alt${note:+; $note}"
+						to=$alt
+						new=$REG_OUT ;;
+					error) status=error note="$alt: $REG_ERR" ;;
+					*) REG_STATE=missing ;;
+				esac
 			fi
-			if [ -z "$new" ]; then
-				status=missing note="$to was not found in the registry${note:+; $note}"
-			elif [ -n "$cur" ] && [ "$cur" = "$new" ]; then
-				status=same note="already the same image (${new:7:12})${note:+; $note}"
+			if [ "$status" = flip ]; then
+				case $REG_STATE in
+					missing) status=missing note="$to was not found in the registry${note:+; $note}" ;;
+					error) status=error note="$to: $REG_ERR" ;;
+					*)
+						registry_digest "$ref"
+						cur=$REG_OUT
+						if [ "$REG_STATE" = ok ] && [ "$cur" = "$new" ]; then
+							status=same note="already the same image (${new:7:12})${note:+; $note}"
+						elif [ "$REG_STATE" = error ]; then
+							note="${note:+$note; }could not compare with $ref: $REG_ERR"
+						fi ;;
+				esac
 			fi
 		fi
+		[ "$status" = error ] && say "registry lookup failed: $note"
 		printf '%s\t%s\t%s\t%s\t%s\n' "$ln" "$ref" "${to:--}" "$status" "${note:--}" >>"$plan"
 	done <"$df"
 }
@@ -896,9 +993,12 @@ counts_text() {
 
 # ----------------------------------------------------------------- main
 
+plan_failed() { awk -F'\t' '$4 == "error" { f = 1 } END { exit !f }' "$1"; }
+
 if [ "$FLIP_PLAN_ONLY" = 1 ]; then
 	plan_flips "$DOCKERFILE" "$OUT/flip-plan.tsv"
 	print_plan "$OUT/flip-plan.tsv"
+	plan_failed "$OUT/flip-plan.tsv" && exit 2
 	exit 0
 fi
 
@@ -930,7 +1030,9 @@ if [ "$FLIP" = 1 ]; then
 	mkdir -p "$FLIPDIR"
 	say "planning the flip preview"
 	plan_flips "$DOCKERFILE" "$FLIPDIR/plan.tsv"
-	if awk -F'\t' '$4 == "flip" { f = 1 } END { exit !f }' "$FLIPDIR/plan.tsv"; then
+	if plan_failed "$FLIPDIR/plan.tsv"; then
+		FLIP_STATE=error
+	elif awk -F'\t' '$4 == "flip" { f = 1 } END { exit !f }' "$FLIPDIR/plan.tsv"; then
 		mkdir -p "$WORK/flip"
 		write_flipped "$DOCKERFILE" "$FLIPDIR/plan.tsv" "$WORK/flip/$(basename "$DOCKERFILE")"
 		cp "$WORK/flip/$(basename "$DOCKERFILE")" "$FLIPDIR/Dockerfile.preview"
@@ -951,6 +1053,9 @@ EXIT=0
 if variant_failed "$CUR"; then
 	VERDICT=FAIL
 	EXIT=1
+elif [ "$FLIP_STATE" = error ]; then
+	VERDICT="PASS now, but the flip preview could not be planned"
+	EXIT=2
 elif [ "$FLIP_STATE" = built ] && variant_failed "$FLIPDIR"; then
 	VERDICT="PASS now, FAIL in the flip preview"
 	[ "$FLIP_WARN_ONLY" = 1 ] || EXIT=3
@@ -994,7 +1099,10 @@ fi
 		echo "### Flip preview"
 		echo
 		print_plan "$FLIPDIR/plan.tsv"
-		if [ "$FLIP_STATE" = nothing ]; then
+		if [ "$FLIP_STATE" = error ]; then
+			echo
+			echo "Preview not built: a registry lookup failed (see the notes), so it is not known which FROM lines move. The run exits 2 rather than passing without a preview."
+		elif [ "$FLIP_STATE" = nothing ]; then
 			echo
 			echo "Nothing to preview: no FROM line moves to a different image."
 		elif [ "$FLIP_STATE" = built ]; then
@@ -1044,6 +1152,7 @@ cp "$OUT/result.json" "$STATE_DIR/last-run.json"
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
 	result=pass
 	[ "$EXIT" = 1 ] && result=fail
+	[ "$EXIT" = 2 ] && result=error
 	[ "$EXIT" = 3 ] && result=flip-fail
 	[ "$EXIT" = 4 ] && result=changed
 	[ "$EXIT" = 0 ] && [ "$FLIP_STATE" = built ] && variant_failed "$FLIPDIR" && result=flip-fail

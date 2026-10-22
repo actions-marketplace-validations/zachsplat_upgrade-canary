@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Stand-in for docker in tests/run.sh. "buildx imagetools inspect" is answered
+# from STUB_REGISTRY: the word 429 answers every lookup with Docker Hub's rate
+# limit error, a file answers from its lines (reference, digest, and the
+# PYTHON_VERSION of the image, or -). Everything else goes to REAL_DOCKER.
+if [ "${1:-}" = buildx ] && [ "${2:-}" = imagetools ] && [ "${3:-}" = inspect ]; then
+	ref=${!#}
+	fmt=
+	prev=
+	for a in "$@"; do
+		[ "$prev" = --format ] && fmt=$a
+		prev=$a
+	done
+	name=${ref##*/library/}
+	if [ "$STUB_REGISTRY" = 429 ]; then
+		repo=${name%%:*}
+		echo "ERROR: unexpected status from HEAD request to https://registry-1.docker.io/v2/library/$repo/manifests/${name#*:}: 429 Too Many Requests" >&2
+		exit 1
+	fi
+	line=$(awk -v r="$name" '$1 == r { print; exit }' "$STUB_REGISTRY")
+	if [ -z "$line" ]; then
+		echo "ERROR: $ref: not found" >&2
+		exit 1
+	fi
+	read -r _ digest pyver <<<"$line"
+	case $fmt in
+		*.Manifest*) printf '{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"%s"}\n' "$digest" ;;
+		*.Image*)
+			if [ "$pyver" = - ]; then printf '{"config":{"Env":["PATH=/usr/bin"]}}\n'
+			else printf '{"config":{"Env":["PATH=/usr/bin","PYTHON_VERSION=%s"]}}\n' "$pyver"; fi ;;
+		*) echo "ERROR: the stand-in does not know the format $fmt" >&2; exit 1 ;;
+	esac
+	exit 0
+fi
+exec "$REAL_DOCKER" "$@"

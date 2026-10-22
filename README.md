@@ -10,7 +10,7 @@ A scheduled check for container images that build green and then do not start.
 2. **Shared libraries.** Every ELF file under the paths you choose (the whole image by default) is listed with the image's own dynamic loader: glibc's `ld-linux` in trace mode (what `ldd` does) or musl's `ld-musl --list`. An executable fails the check when a library or a symbol version is not found, or when the interpreter it names is missing, as with a musl binary in a glibc image. A static busybox is copied into the container for the scan, so images without a shell work too.
 3. **Start.** Runs the image with a smoke command and checks the exit code, or waits for a log line or for a URL to answer 2xx, under a timeout. The URL is fetched from inside the container's network namespace, so no host port is published. With `--compose` it starts your compose file with the new image and checks one service.
 4. **Packages.** Writes the runtime package list (syft in a container, or the image's dpkg, apk or rpm database), the packages each build stage installed (from the apk, apt and pip lines in the build log) and the digest each base image resolved to, then diffs them against the last green run. Names are compared with version numbers taken out, so `openssl-3.6-dev 3.6.5-r1` to `openssl-4.0-dev 4.0.3-r6` shows as one change.
-5. **Flip preview.** Copies the Dockerfile, moves floating base tags to their next value and runs the same checks on the copy: `node:lts` to `node:26` (variants kept, so `node:lts-slim` becomes `node:26-slim`), `ubuntu:latest` to `ubuntu:26.04`, and `python:3` to the newest `3.x` tag that exists (the `3.N-rc` tag until `3.N` is published). `--flip FROM=TO` adds your own. A tag that already points at the target image is reported and not rebuilt.
+5. **Flip preview.** Copies the Dockerfile, moves floating base tags to their next value and runs the same checks on the copy: `node:lts` to `node:26` (variants kept, so `node:lts-slim` becomes `node:26-slim`), `ubuntu:latest` to `ubuntu:26.04`, and `python:3` to the newest `3.x` tag that exists (the `3.N-rc` tag until `3.N` is published, but only once that tag holds a release candidate rather than an alpha or a beta). `--flip FROM=TO` adds your own. A tag that already points at the target image is reported and not rebuilt. The planner looks tags up in the registry; a lookup that fails for any reason other than "not found" (a rate limit, a login error, a network error) is shown in the plan with the registry's message, no preview is built, and the run exits 2, so a failed lookup is never reported as "nothing to preview".
 
 The summary is Markdown on stdout, and is appended to `$GITHUB_STEP_SUMMARY` when that is set.
 
@@ -36,15 +36,17 @@ Build caches make this harder to see. `RUN --mount=type=cache` keeps cargo's tar
 | Start | pass | exited 0 |
 | Packages | info | 801 entries listed; no previous list to compare |
 
+Monitor 1.7.0, released on 2026-10-22, fixes it ([OpenZeppelin/openzeppelin-monitor#506](https://github.com/OpenZeppelin/openzeppelin-monitor/pull/506) moves the script runtime to Node.js 24). Run against the published `v1.7.0` image the same day, the library check passes, 158 of 158 ELF files resolve, and `node` (v24.22.1) and `jq` (1.8.2) run. With the 1.6.0 list as the previous run, the package diff shows what changed underneath: `ld-linux` 2.42-r7 to `ld-linux-2.44` 2.44-r8, and `nodejs-26` 26.5.0 to `nodejs-24` 24.22.1.
+
 ### pnpm 12
 
 `npm install -g pnpm` now installs pnpm 12. The Relayer's `main` pins `pnpm@10` with the comment "pnpm 12 ships a preinstall script that newer npm blocks by default, which leaves a broken pnpm shim". When I built the branch of OpenZeppelin/openzeppelin-relayer#862 on 2026-10-10, which predates that pin, `pnpm install` failed with `ERR_PNPM_IGNORED_BUILDS` on esbuild until I pinned `pnpm@10`. Nothing in the branch had changed; the package manager had. A scheduled clean build shows this on the day it happens, and the package diff names the version that moved when the build still passes.
 
 ### Tags that move on a date
 
-- `node:lts` becomes Node 26 on 2026-10-28. Node 26 images ship without yarn ([nodejs/docker-node#2422](https://github.com/nodejs/docker-node/pull/2422)) and without corepack, and `node:26-slim` is built on Debian 13 where `node:lts-slim` is on Debian 12. The fixture in `tests/fixtures/node-corepack` passes on today's `node:lts-slim` (Node 24.21.0) and fails in the preview with `corepack: not found`. `Dockerfile.fixed` next to it installs corepack from npm and passes on both.
-- The Docker tag `ubuntu:latest` already has the same digest as `ubuntu:26.04` (checked 2026-10-11), so the preview reports it as the same image and builds nothing. An image still pinned to the previous release can preview the move with `--flip ubuntu:24.04=ubuntu:26.04`: on a copy of the Ubuntu fixture with `FROM ubuntu:24.04`, both builds pass, and curl goes from 8.5.0 to 8.18.0 and OpenSSL from 3.0.13 to 3.5.5 among 124 changed, 30 added and 4 removed packages. The GitHub runner label `ubuntu-latest` moves to Ubuntu 26.04 between 2026-10-19 and 2026-11-19 ([actions/runner-images#14748](https://github.com/actions/runner-images/issues/14748)); a container cannot preview that, so the example workflow below runs on `ubuntu-26.04` as well.
-- `python:3` still points at 3.14 (3.14.8). Python 3.15.0 was released on 2026-10-09 and on 2026-10-11 there was no `python:3.15` tag yet, so the preview uses `python:3.15-rc`, which still carries 3.15.0rc3.
+- `node:lts` becomes Node 26 on 2026-10-28. Node 26 images ship without yarn ([nodejs/docker-node#2422](https://github.com/nodejs/docker-node/pull/2422)) and without corepack, and `node:26-slim` is built on Debian 13 where `node:lts-slim` is on Debian 12. The fixture in `tests/fixtures/node-corepack` passes on `node:lts-slim` (Node 24.22.1 on 2026-10-22) and fails in the preview with `corepack: not found`. `Dockerfile.fixed` next to it installs corepack from npm and passes on both.
+- The Docker tag `ubuntu:latest` already has the same digest as `ubuntu:26.04` (checked 2026-10-11 and again on 2026-10-22), so the preview reports it as the same image and builds nothing. An image still pinned to the previous release can preview the move with `--flip ubuntu:24.04=ubuntu:26.04`: on a copy of the Ubuntu fixture with `FROM ubuntu:24.04`, both builds pass, and curl goes from 8.5.0 to 8.18.0 and OpenSSL from 3.0.13 to 3.5.5 among 123 changed, 27 added and 4 removed packages (run on 2026-10-22). The GitHub runner label `ubuntu-latest` moves to Ubuntu 26.04 between 2026-10-19 and 2026-11-19 ([actions/runner-images#14748](https://github.com/actions/runner-images/issues/14748)); a container cannot preview that, so the example workflow below runs on `ubuntu-26.04` as well.
+- `python:3` now points at 3.15 (3.15.1 on 2026-10-22), the newest release, so the Python preview has nothing to build. `python:3.16-rc` exists but holds 3.16.0a1, an alpha that few packages publish wheels for, so the planner reports it and waits for a 3.16 release candidate.
 
 ## Usage
 
@@ -140,13 +142,13 @@ Only print what the preview would substitute:
 | `--state-dir DIR`, `--previous FILE`, `--fail-on-change` | where the last green package list lives |
 | `--registry-mirror HOST`, `--cpus N`, `--memory SIZE` | for rate limits and shared machines |
 
-Exit status: 0 pass, 1 a check failed, 2 usage or setup error, 3 the preview failed while the current build passed, 4 packages changed (with `--fail-on-change`).
+Exit status: 0 pass, 1 a check failed, 2 usage or setup error (also when a registry lookup for the preview fails), 3 the preview failed while the current build passed, 4 packages changed (with `--fail-on-change`).
 
 Each run writes `.canary/runs/<run>/` (the summary, the build log, the library scan, the start log, the package lists and the diffs as JSON) and, when the current build passes, `.canary/last-green.json` for the next run to diff against. The built image stays in Docker as `canary/<name>:<run>` (`-flip` appended for the preview, or your `--tag`) and old run directories are kept, so a machine that runs this on a schedule gains one image per run (two with the preview). They are tagged, so `docker image prune` without `-a` leaves them; remove them with `docker image ls --format '{{.Repository}}:{{.Tag}}' 'canary/*' | xargs -r docker rmi`, and clear `.canary/runs/` now and then. With a fixed `--tag`, each run untags the previous image instead, and `docker image prune` does remove those.
 
 ## GitHub Action
 
-`action.yml` wraps the CLI. It restores the last green package list from the Actions cache, runs the checks, saves the list again and uploads the run directory as an artifact. The example pins it to a commit of this repository; `zachsplat/upgrade-canary@main` also works and follows every change I push to `main`. A copy of this repository under `.github/actions/canary` in yours, referenced by that path, works too.
+`action.yml` wraps the CLI. It restores the last green package list from the Actions cache, runs the checks, saves the list again and uploads the run directory as an artifact. `@v1` follows the v1 releases; pin a commit SHA if you prefer, or use `@main` to follow every change I push to `main`. A copy of this repository under `.github/actions/canary` in yours, referenced by that path, works too.
 
 ```yaml
 name: upgrade canary
@@ -168,7 +170,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: zachsplat/upgrade-canary@3df0c83a8ee4b32feb5c9e115228e2eb866043dd
+      - uses: zachsplat/upgrade-canary@v1
         with:
           name: app-${{ matrix.runner }}
           dockerfile: Dockerfile
@@ -177,7 +179,7 @@ jobs:
           flip-preview: "true"
 ```
 
-Inputs mirror the CLI options (`dockerfile`, `context`, `target`, `build-args` one per line, `image`, `elf-paths`, `elf-exclude`, `strict-libs`, `smoke`, `entrypoint`, `expect-exit`, `ready-log`, `ready-url`, `run-args` one per line, `compose`, `service`, `timeout`, `settle`, `sbom`, `flip-preview`, `flips` one per line, `flip-warn-only`, `fail-on-change`, `registry-mirror`, `cpus`, `name`, `upload-artifact`). Outputs: `result` (pass, fail, flip-fail or changed), `summary`, `image`, `changed`. Give each matrix entry its own `name`, since the cache key and the artifact name come from it. Scheduled workflows run on the default branch, and the Actions cache is evicted after 7 days without use, so a daily or weekly schedule keeps the baseline.
+Inputs mirror the CLI options (`dockerfile`, `context`, `target`, `build-args` one per line, `image`, `elf-paths`, `elf-exclude`, `strict-libs`, `smoke`, `entrypoint`, `expect-exit`, `ready-log`, `ready-url`, `run-args` one per line, `compose`, `service`, `timeout`, `settle`, `sbom`, `flip-preview`, `flips` one per line, `flip-warn-only`, `fail-on-change`, `registry-mirror`, `cpus`, `name`, `upload-artifact`). Outputs: `result` (pass, fail, flip-fail, changed, or error when a registry lookup for the preview failed), `summary`, `image`, `changed`. Give each matrix entry its own `name`, since the cache key and the artifact name come from it. Scheduled workflows run on the default branch, and the Actions cache is evicted after 7 days without use, so a daily or weekly schedule keeps the baseline.
 
 ## Requirements
 
@@ -190,7 +192,7 @@ Linux, Docker with buildx 0.13 or later and the docker-container driver (and the
 - Shared objects with missing libraries, such as plugins and language extension modules, are notes rather than failures unless you pass `--strict-libs`. The official `python:3.12-slim` image, for example, ships a `_tkinter` module whose Tk libraries are not installed.
 - The preview knows `node:lts`, `ubuntu:latest` and `python:3` tags (with their variants). FROM lines set by a build argument or pinned by digest are not substituted; pass `--build-arg` or `--flip` for those.
 - Every run is a cold build, by design. The Relayer's took between 5 min 27 s and 6 min 51 s on 6 CPUs.
-- Docker Hub limits anonymous pulls per address (100 an hour when I hit it on 2026-10-11), and a cold builder pulls every base image on every run. Log in first, or pass `--registry-mirror mirror.gcr.io`.
+- Docker Hub limits anonymous pulls per address (100 an hour when I hit it on 2026-10-11), and a cold builder pulls every base image on every run. Log in first, or pass `--registry-mirror mirror.gcr.io`. When the limit is hit during the preview's tag lookups, the run says so and exits 2.
 - syft needs the local Docker socket. With a remote `DOCKER_HOST` the runtime list comes from the image's package database.
 - Package families are matched by name with version numbers removed. A package that was renamed outright shows as one removal and one addition, and two different packages whose names differ only by a number are paired: Ubuntu 26.04's curl links libssh2 where 24.04's linked libssh, and the diff shows that as `libssh-4` changing to `libssh2-1t64`.
 - `--builder NAME` prunes every exec cache mount on that builder, including other projects' ones.
@@ -198,7 +200,7 @@ Linux, Docker with buildx 0.13 or later and the docker-container driver (and the
 
 ## Tests
 
-`tests/run.sh` builds the fixtures in `tests/fixtures` and checks the verdicts: a passing Alpine image, a binary copied without its library (glibc and musl), a musl binary in a glibc image, the cache mount behaviour, every start check mode, how `--smoke` is split into words, the package diff and build log parsers, the flip planner, and the node and ubuntu previews. `tests/run.sh --list` names them; pass names to run a subset.
+`tests/run.sh` builds the fixtures in `tests/fixtures` and checks the verdicts: a passing Alpine image, a binary copied without its library (glibc and musl), a musl binary in a glibc image, the cache mount behaviour, every start check mode, how `--smoke` is split into words, the package diff and build log parsers, the flip planner, the node and ubuntu previews, and, against a stand-in registry (`tests/fixtures/stub-registry`), a failed lookup (Docker Hub's 429) and the Python release candidate rule. `tests/run.sh --list` names them; pass names to run a subset.
 
 ## License
 
