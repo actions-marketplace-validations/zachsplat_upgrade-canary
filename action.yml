@@ -90,7 +90,7 @@ inputs:
 
 outputs:
   result:
-    description: pass, fail, flip-fail or changed.
+    description: pass, fail, flip-fail, changed or error (a registry lookup for the flip preview failed).
     value: ${{ steps.canary.outputs.result }}
   summary:
     description: Path of the Markdown summary.

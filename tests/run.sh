@@ -5,8 +5,10 @@
 #
 # Needs what canary.sh needs (Docker with buildx, jq). The builds are small
 # (busybox, Alpine, Debian slim, Node slim, Ubuntu); the node and ubuntu tests
-# also build a flip preview. Set CANARY_REGISTRY_MIRROR=mirror.gcr.io if Docker
-# Hub rate limits get in the way, and KEEP_IMAGES=1 to keep the test images.
+# also build a flip preview, and lookup_error and python_rc answer registry
+# lookups from a stand-in (tests/fixtures/stub-registry). Set
+# CANARY_REGISTRY_MIRROR=mirror.gcr.io if Docker Hub rate limits get in the
+# way, and KEEP_IMAGES=1 to keep the test images.
 
 set -uo pipefail
 
@@ -14,6 +16,10 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CANARY=$HERE/../canary.sh
 FX=$HERE/fixtures
 LIB=$HERE/../lib
+REAL_DOCKER=$(command -v docker)
+export REAL_DOCKER
+STUB=$FX/stub-registry
+HELPER=$(sed -n "s/^HELPER_IMAGE_DEFAULT='\(.*\)'$/\1/p" "$CANARY")
 export CANARY_PREFIX=${CANARY_PREFIX:-canary-test}
 P=$CANARY_PREFIX
 T=$(mktemp -d "${TMPDIR:-/tmp}/canary-tests.XXXXXX")
@@ -82,7 +88,11 @@ t_flip_plan() {
 	has flip-plan '| 3 | `node:lts` | `node:26` | flip |'
 	has flip-plan '| 4 | `node:lts-slim` | `node:26-slim` | flip |'
 	has flip-plan '`ubuntu:26.04`'
-	has flip-plan '| 7 | `python:3-slim` | `python:3.'
+	# python:3-slim previews the next minor, or none until it has a release
+	# candidate; t_python_rc checks both against a stand-in registry
+	has flip-plan '| 7 | `python:3-slim` |'
+	lacks flip-plan '| error |'
+	lacks flip-plan '| missing |'
 	has flip-plan '| 8 | `python:3.14` | - | none |'
 	has flip-plan 'set by a build argument'
 	has flip-plan 'pinned by digest'
@@ -90,6 +100,41 @@ t_flip_plan() {
 	has flip-plan '| 12 | `scratch` | - | skip |'
 	has flip-plan '| 13 | `alpine:3.22` | - | none |'
 	has flip-plan 'node:26-alpine3.19 does not exist; using node:26-alpine'
+}
+
+# A lookup that fails for any reason other than "not found" is an error, never
+# "missing" or "nothing to preview". tests/fixtures/stub-registry/docker stands
+# in for docker and answers every lookup with Docker Hub's 429.
+t_lookup_error() {
+	local out=$T/lookup-run.out
+	STUB_REGISTRY=429 PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= \
+		run lookup-429 2 --flip-plan -f "$STUB/Dockerfile" "$STUB"
+	has lookup-429 '| 1 | `python:3-slim` | - | error | python:3-slim: unexpected status from HEAD request to https://registry-1.docker.io/v2/library/python/manifests/3-slim: 429 Too Many Requests (rate limited; log in with docker login, or pass --registry-mirror mirror.gcr.io for Docker Hub images) |'
+	has lookup-429 '| 2 | `node:lts-slim` | `node:26-slim` | error | node:26-slim: unexpected status'
+	has lookup-429 '| 3 | `ubuntu:latest` | `ubuntu:26.04` | error |'
+	has lookup-429 '| 4 | `node:lts-alpine3.19` | `node:26-alpine3.19` | error |'
+	lacks lookup-429 'was not found in the registry'
+	# a full run: the image itself passes, the preview cannot be planned
+	: >"$out"
+	GITHUB_OUTPUT=$out STUB_REGISTRY=429 PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= \
+		run lookup-429-run 2 --image "$HELPER" -f "$STUB/Dockerfile" --flip-preview --no-elf --no-start --sbom none
+	has lookup-429-run "PASS now, but the flip preview could not be planned"
+	has lookup-429-run "Preview not built: a registry lookup failed"
+	lacks lookup-429-run "Nothing to preview"
+	if grep -qx 'result=error' "$out"; then ok "lookup-429-run sets result=error"; else bad "lookup-429-run result: $(grep '^result=' "$out")"; fi
+}
+
+# python:3 previews the 3.(N+1)-rc tag only once it holds a release candidate.
+t_python_rc() {
+	STUB_REGISTRY=$STUB/alpha.tsv PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= \
+		run python-alpha 0 --flip-plan -f "$STUB/Dockerfile" "$STUB"
+	has python-alpha '| 1 | `python:3-slim` | - | none | python:3-slim is the newest 3.x release (3.15.1); python:3.16-rc-slim holds 3.16.0a1, not a release candidate yet |'
+	has python-alpha '| 2 | `node:lts-slim` | `node:26-slim` | flip |'
+	has python-alpha '| 3 | `ubuntu:latest` | `ubuntu:26.04` | same | already the same image (555555555555) |'
+	has python-alpha 'node:26-alpine3.19 does not exist; using node:26-alpine'
+	STUB_REGISTRY=$STUB/rc.tsv PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= \
+		run python-rc 0 --flip-plan -f "$STUB/Dockerfile" "$STUB"
+	has python-rc '| 1 | `python:3-slim` | `python:3.16-rc-slim` | flip | python:3.16-slim is not tagged yet; using the release candidate tag (3.16.0rc1) |'
 }
 
 t_ok_musl() {
@@ -206,7 +251,7 @@ t_ubuntu_flip() {
 	has ubuntu-back "#### Packages, now against the preview"
 }
 
-ALL=(pkgdiff buildlog smoke_split flip_plan ok_musl missing_lib wrong_libc cachemount start_modes node_flip ubuntu_flip)
+ALL=(pkgdiff buildlog smoke_split flip_plan lookup_error python_rc ok_musl missing_lib wrong_libc cachemount start_modes node_flip ubuntu_flip)
 if [ "${1:-}" = --list ]; then printf '%s\n' "${ALL[@]}"; exit 0; fi
 [ $# -gt 0 ] && ALL=("$@")
 
