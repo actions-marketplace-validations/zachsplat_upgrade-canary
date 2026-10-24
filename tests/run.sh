@@ -5,8 +5,8 @@
 #
 # Needs what canary.sh needs (Docker with buildx, jq). The builds are small
 # (busybox, Alpine, Debian slim, Node slim, Ubuntu); the node and ubuntu tests
-# also build a flip preview, and lookup_error and python_rc answer registry
-# lookups from a stand-in (tests/fixtures/stub-registry). Set
+# also build a flip preview, and lookup_error, lookup_retry and python_rc
+# answer registry lookups from a stand-in (tests/fixtures/stub-registry). Set
 # CANARY_REGISTRY_MIRROR=mirror.gcr.io if Docker Hub rate limits get in the
 # way, and KEEP_IMAGES=1 to keep the test images.
 
@@ -21,6 +21,9 @@ export REAL_DOCKER
 STUB=$FX/stub-registry
 HELPER=$(sed -n "s/^HELPER_IMAGE_DEFAULT='\(.*\)'$/\1/p" "$CANARY")
 export CANARY_PREFIX=${CANARY_PREFIX:-canary-test}
+# lookup_error and lookup_retry set their own waits; every other test gets the
+# defaults
+unset CANARY_LOOKUP_RETRY
 P=$CANARY_PREFIX
 T=$(mktemp -d "${TMPDIR:-/tmp}/canary-tests.XXXXXX")
 PASSED=0
@@ -63,6 +66,19 @@ lacks() {
 	if grep -qF -- "$2" "$T/$1.md"; then bad "$1 should not say: $2"; else ok "$1 does not say: $2"; fi
 }
 
+# logs NAME TEXT: the stderr of NAME contains TEXT
+logs() {
+	if grep -qF -- "$2" "$T/$1.err"; then ok "$1 logs: $2"; else bad "$1 does not log: $2"; fi
+}
+
+# tried FILE N LOOKUP: the stand-in answered LOOKUP ("Manifest REF" or
+# "Image REF") N times
+tried() {
+	local got
+	got=$(grep -cxF -- "$3" "$1")
+	if [ "$got" = "$2" ]; then ok "$3 looked up $got times"; else bad "$3 looked up $got times, expected $2"; fi
+}
+
 t_pkgdiff() {
 	jq -n --slurpfile old "$FX/pkgdiff/old.json" --slurpfile new "$FX/pkgdiff/new.json" -f "$LIB/pkgdiff.jq" >"$T/pkgdiff.json"
 	local counts row
@@ -103,25 +119,75 @@ t_flip_plan() {
 }
 
 # A lookup that fails for any reason other than "not found" is an error, never
-# "missing" or "nothing to preview". tests/fixtures/stub-registry/docker stands
-# in for docker and answers every lookup with Docker Hub's 429.
+# "missing" or "nothing to preview", once its retries are used up.
+# tests/fixtures/stub-registry/docker stands in for docker and answers every
+# lookup with Docker Hub's 429; the retries wait 0 s here.
 t_lookup_error() {
-	local out=$T/lookup-run.out
-	STUB_REGISTRY=429 PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= \
+	local out=$T/lookup-run.out calls=$T/lookup-429.calls
+	: >"$calls"
+	STUB_REGISTRY=429 STUB_CALLS=$calls PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= CANARY_LOOKUP_RETRY="0 0 0" \
 		run lookup-429 2 --flip-plan -f "$STUB/Dockerfile" "$STUB"
-	has lookup-429 '| 1 | `python:3-slim` | - | error | python:3-slim: unexpected status from HEAD request to https://registry-1.docker.io/v2/library/python/manifests/3-slim: 429 Too Many Requests (rate limited; log in with docker login, or pass --registry-mirror mirror.gcr.io for Docker Hub images) |'
+	has lookup-429 '| 1 | `python:3-slim` | - | error | python:3-slim: unexpected status from HEAD request to https://registry-1.docker.io/v2/library/python/manifests/3-slim: 429 Too Many Requests (rate limited; log in with docker login, or pass --registry-mirror mirror.gcr.io for Docker Hub images; tried 4 times) |'
 	has lookup-429 '| 2 | `node:lts-slim` | `node:26-slim` | error | node:26-slim: unexpected status'
 	has lookup-429 '| 3 | `ubuntu:latest` | `ubuntu:26.04` | error |'
 	has lookup-429 '| 4 | `node:lts-alpine3.19` | `node:26-alpine3.19` | error |'
 	lacks lookup-429 'was not found in the registry'
+	tried "$calls" 4 'Image python:3-slim'
+	tried "$calls" 4 'Manifest node:26-slim'
+	tried "$calls" 4 'Manifest ubuntu:26.04'
+	tried "$calls" 4 'Manifest node:26-alpine3.19'
+	logs lookup-429 'registry lookup of node:26-slim failed (unexpected status'
 	# a full run: the image itself passes, the preview cannot be planned
 	: >"$out"
-	GITHUB_OUTPUT=$out STUB_REGISTRY=429 PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= \
+	GITHUB_OUTPUT=$out STUB_REGISTRY=429 PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= CANARY_LOOKUP_RETRY="0 0 0" \
 		run lookup-429-run 2 --image "$HELPER" -f "$STUB/Dockerfile" --flip-preview --no-elf --no-start --sbom none
 	has lookup-429-run "PASS now, but the flip preview could not be planned"
 	has lookup-429-run "Preview not built: a registry lookup failed"
 	lacks lookup-429-run "Nothing to preview"
 	if grep -qx 'result=error' "$out"; then ok "lookup-429-run sets result=error"; else bad "lookup-429-run result: $(grep '^result=' "$out")"; fi
+}
+
+# Lookups that fail twice and then answer give the plan python_rc gets, and
+# "not found" is not tried again. Then the default waits (2, 5 and 10 s) on one
+# FROM line, one try with CANARY_LOOKUP_RETRY="", and a bad value.
+t_lookup_retry() {
+	local calls=$T/lookup-flaky.calls start took
+	: >"$calls"
+	STUB_REGISTRY=$STUB/alpha.tsv STUB_CALLS=$calls STUB_FAIL_FIRST=2 PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= CANARY_LOOKUP_RETRY="0 0 0" \
+		run lookup-flaky 0 --flip-plan -f "$STUB/Dockerfile" "$STUB"
+	has lookup-flaky '| 1 | `python:3-slim` | - | none | python:3-slim is the newest 3.x release (3.15.1); python:3.16-rc-slim holds 3.16.0a1, not a release candidate yet |'
+	has lookup-flaky '| 2 | `node:lts-slim` | `node:26-slim` | flip |'
+	has lookup-flaky '| 3 | `ubuntu:latest` | `ubuntu:26.04` | same | already the same image (555555555555) |'
+	has lookup-flaky 'node:26-alpine3.19 does not exist; using node:26-alpine'
+	lacks lookup-flaky '| error |'
+	tried "$calls" 3 'Manifest node:26-slim'
+	tried "$calls" 3 'Manifest node:26-alpine3.19'
+	logs lookup-flaky 'registry lookup of node:26-slim failed (failed to copy: httpReadSeeker: failed open: unexpected status from GET request to https://registry-1.docker.io/v2/library/node/manifests/26-slim: 502 Bad Gateway); trying again in 0 s'
+	: >"$calls"
+	STUB_REGISTRY=$STUB/alpha.tsv STUB_CALLS=$calls PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= CANARY_LOOKUP_RETRY="0 0 0" \
+		run lookup-missing 0 --flip-plan -f "$STUB/Dockerfile" "$STUB"
+	tried "$calls" 1 'Manifest node:26-alpine3.19'
+	tried "$calls" 1 'Manifest python:3.16-slim'
+	mkdir -p "$T/one-from"
+	echo 'FROM node:lts-slim' >"$T/one-from/Dockerfile"
+	: >"$calls"
+	start=$SECONDS
+	STUB_REGISTRY=429 STUB_CALLS=$calls PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= \
+		run lookup-default 2 --flip-plan -f "$T/one-from/Dockerfile" "$T/one-from"
+	took=$((SECONDS - start))
+	if [ "$took" -ge 17 ] && [ "$took" -lt 40 ]; then ok "lookup-default took $took s (waits 2, 5, 10)"; else bad "lookup-default took $took s, expected 17 to 40"; fi
+	tried "$calls" 4 'Manifest node:26-slim'
+	logs lookup-default 'trying again in 2 s'
+	logs lookup-default 'trying again in 5 s'
+	logs lookup-default 'trying again in 10 s'
+	has lookup-default 'mirror.gcr.io for Docker Hub images; tried 4 times) |'
+	: >"$calls"
+	STUB_REGISTRY=429 STUB_CALLS=$calls PATH=$STUB:$PATH CANARY_REGISTRY_MIRROR= CANARY_LOOKUP_RETRY= \
+		run lookup-once 2 --flip-plan -f "$T/one-from/Dockerfile" "$T/one-from"
+	tried "$calls" 1 'Manifest node:26-slim'
+	lacks lookup-once 'tried'
+	CANARY_LOOKUP_RETRY="2 x" run lookup-bad-value 2 --flip-plan -f "$T/one-from/Dockerfile" "$T/one-from"
+	logs lookup-bad-value "CANARY_LOOKUP_RETRY takes waits in whole seconds, got 'x'"
 }
 
 # python:3 previews the 3.(N+1)-rc tag only once it holds a release candidate.
@@ -251,7 +317,7 @@ t_ubuntu_flip() {
 	has ubuntu-back "#### Packages, now against the preview"
 }
 
-ALL=(pkgdiff buildlog smoke_split flip_plan lookup_error python_rc ok_musl missing_lib wrong_libc cachemount start_modes node_flip ubuntu_flip)
+ALL=(pkgdiff buildlog smoke_split flip_plan lookup_error lookup_retry python_rc ok_musl missing_lib wrong_libc cachemount start_modes node_flip ubuntu_flip)
 if [ "${1:-}" = --list ]; then printf '%s\n' "${ALL[@]}"; exit 0; fi
 [ $# -gt 0 ] && ALL=("$@")
 

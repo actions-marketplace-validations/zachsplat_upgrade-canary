@@ -8,7 +8,7 @@
 
 set -uo pipefail
 
-CANARY_VERSION=1.0.1
+CANARY_VERSION=1.0.2
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LIB=$HERE/lib
 
@@ -86,6 +86,8 @@ Flip preview
   --flip-plan              print the substitutions and exit (2 when a registry
                            lookup failed)
   --flip-warn-only         exit 0 when only the preview fails
+  A tag lookup that fails for any reason but "not found" is tried again after
+  2, 5 and 10 s; CANARY_LOOKUP_RETRY sets the waits ("2 5 10"; "" tries once)
 
 Other
   --name NAME              label for the summary
@@ -115,6 +117,7 @@ BUILDKIT_IMAGE=
 CPUS=
 MEMORY=
 MIRROR=${CANARY_REGISTRY_MIRROR:-}
+LOOKUP_RETRY=${CANARY_LOOKUP_RETRY-2 5 10}
 BUILD_TIMEOUT=3600
 SCAN_TIMEOUT=900
 ELF_PATHS=/
@@ -207,6 +210,10 @@ done
 case $SBOM in syft|db|none) ;; *) die "--sbom must be syft, db or none" ;; esac
 for n in "$BUILD_TIMEOUT" "$TIMEOUT" "$SETTLE" "$EXPECT_EXIT"; do
 	[[ $n =~ ^[0-9]+$ ]] || die "expected a whole number, got '$n'"
+done
+read -r -a LOOKUP_WAITS <<<"$LOOKUP_RETRY"
+for n in ${LOOKUP_WAITS[@]+"${LOOKUP_WAITS[@]}"}; do
+	[[ $n =~ ^[0-9]+$ ]] || die "CANARY_LOOKUP_RETRY takes waits in whole seconds, got '$n'"
 done
 [ -n "$COMPOSE" ] && [ -z "$SERVICE" ] && die "--compose needs --service"
 [ -n "$COMPOSE" ] && [ ! -f "$COMPOSE" ] && die "compose file $COMPOSE not found"
@@ -605,50 +612,63 @@ lookup_ref() {
 	printf '%s' "$r"
 }
 
-# A failed lookup gets a hint for what usually fixes it.
+# A failed lookup gets a hint for what usually fixes it, and how many times it
+# was tried.
 lookup_hint() {
+	local hint=
 	case ${1,,} in
 		*429*|*toomanyrequests*|*'too many requests'*)
 			if [ -n "$MIRROR" ]; then
-				printf '%s (rate limited; run again later or log in)' "$1"
+				hint='rate limited; run again later or log in'
 			else
-				printf '%s (rate limited; log in with docker login, or pass --registry-mirror mirror.gcr.io for Docker Hub images)' "$1"
+				hint='rate limited; log in with docker login, or pass --registry-mirror mirror.gcr.io for Docker Hub images'
 			fi ;;
-		*401*|*403*|*unauthorized*|*denied*|*authorize*) printf '%s (log in to that registry with docker login)' "$1" ;;
-		*) printf '%s' "$1" ;;
+		*401*|*403*|*unauthorized*|*denied*|*authorize*) hint='log in to that registry with docker login' ;;
 	esac
+	[ "${2:-1}" -gt 1 ] && hint="${hint:+$hint; }tried $2 times"
+	printf '%s%s' "$1" "${hint:+ ($hint)}"
 }
 
 # Registry lookups go through imagetools and are cached; callers read REG_OUT,
 # REG_STATE and REG_ERR (no subshell, so the cache survives). REG_STATE is ok,
 # missing (the registry says the reference does not exist) or error (anything
 # else: a rate limit, a login error, a network error), with the message in
-# REG_ERR. Only missing may be read as "this tag does not exist".
+# REG_ERR. Only missing may be read as "this tag does not exist". An error is
+# tried again after each wait in LOOKUP_WAITS before it is kept.
 declare -A REG_CACHE=() REG_CACHE_STATE=() REG_CACHE_ERR=()
 REG_OUT=
 REG_STATE=
 REG_ERR=
 registry_inspect() {
-	local ref=$1 what=$2 key="$2 $1" out rc err
+	local ref=$1 what=$2 key="$2 $1" out rc err state tries=0 delay
 	if [ -z "${REG_CACHE_STATE[$key]+set}" ]; then
-		out=$(docker buildx imagetools inspect --format "{{json .$what}}" "$(lookup_ref "$ref")" 2>"$WORK/imagetools.err")
-		rc=$?
-		err=$(sed -n 's/^ERROR: //p' "$WORK/imagetools.err" | head -n 1)
-		[ -n "$err" ] || err=$(grep -v '^[[:space:]]*$' "$WORK/imagetools.err" | tail -n 1)
-		err=$(printf '%s' "$err" | tr '\t\r' '  ' | cut -c 1-300)
-		if [ "$rc" = 0 ] && [ -n "$out" ]; then
-			REG_CACHE[$key]=$out
-			REG_CACHE_STATE[$key]=ok
-			REG_CACHE_ERR[$key]=
-		elif printf '%s' "$err" | grep -qiE ': not found$|manifest unknown|name unknown'; then
-			REG_CACHE[$key]=
-			REG_CACHE_STATE[$key]=missing
-			REG_CACHE_ERR[$key]=
-		else
-			REG_CACHE[$key]=
-			REG_CACHE_STATE[$key]=error
-			REG_CACHE_ERR[$key]=$(lookup_hint "${err:-docker buildx imagetools inspect exited $rc}")
-		fi
+		while :; do
+			out=$(docker buildx imagetools inspect --format "{{json .$what}}" "$(lookup_ref "$ref")" 2>"$WORK/imagetools.err")
+			rc=$?
+			tries=$((tries + 1))
+			err=$(sed -n 's/^ERROR: //p' "$WORK/imagetools.err" | head -n 1)
+			[ -n "$err" ] || err=$(grep -v '^[[:space:]]*$' "$WORK/imagetools.err" | tail -n 1)
+			err=$(printf '%s' "$err" | tr '\t\r' '  ' | cut -c 1-300)
+			if [ "$rc" = 0 ] && [ -n "$out" ]; then
+				state=ok
+			elif printf '%s' "$err" | grep -qiE ': not found$|manifest unknown|name unknown'; then
+				state=missing
+			else
+				state=error
+				err=${err:-docker buildx imagetools inspect exited $rc}
+			fi
+			[ "$state" = error ] && [ "$tries" -le "${#LOOKUP_WAITS[@]}" ] || break
+			delay=${LOOKUP_WAITS[$((tries - 1))]}
+			say "registry lookup of $ref failed ($err); trying again in $delay s"
+			sleep "$delay"
+		done
+		REG_CACHE_STATE[$key]=$state
+		REG_CACHE[$key]=
+		REG_CACHE_ERR[$key]=
+		case $state in
+			ok) REG_CACHE[$key]=$out ;;
+			error) REG_CACHE_ERR[$key]=$(lookup_hint "$err" "$tries") ;;
+		esac
 	fi
 	REG_OUT=${REG_CACHE[$key]}
 	REG_STATE=${REG_CACHE_STATE[$key]}

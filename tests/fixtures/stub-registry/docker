@@ -2,7 +2,10 @@
 # Stand-in for docker in tests/run.sh. "buildx imagetools inspect" is answered
 # from STUB_REGISTRY: the word 429 answers every lookup with Docker Hub's rate
 # limit error, a file answers from its lines (reference, digest, and the
-# PYTHON_VERSION of the image, or -). Everything else goes to REAL_DOCKER.
+# PYTHON_VERSION of the image, or -). With STUB_CALLS set, each lookup appends
+# "Manifest REF" or "Image REF" to that file, and the first STUB_FAIL_FIRST
+# lookups of each get the 502 Docker Hub returned on 2026-10-22. Everything
+# else goes to REAL_DOCKER.
 if [ "${1:-}" = buildx ] && [ "${2:-}" = imagetools ] && [ "${3:-}" = inspect ]; then
 	ref=${!#}
 	fmt=
@@ -12,6 +15,16 @@ if [ "${1:-}" = buildx ] && [ "${2:-}" = imagetools ] && [ "${3:-}" = inspect ];
 		prev=$a
 	done
 	name=${ref##*/library/}
+	kind=${fmt#*.}
+	kind=${kind%%\}*}
+	if [ -n "${STUB_CALLS:-}" ]; then
+		n=$(grep -cxF "$kind $name" "$STUB_CALLS" 2>/dev/null)
+		echo "$kind $name" >>"$STUB_CALLS"
+		if [ "${n:-0}" -lt "${STUB_FAIL_FIRST:-0}" ]; then
+			echo "ERROR: failed to copy: httpReadSeeker: failed open: unexpected status from GET request to https://registry-1.docker.io/v2/library/${name%%:*}/manifests/${name#*:}: 502 Bad Gateway" >&2
+			exit 1
+		fi
+	fi
 	if [ "$STUB_REGISTRY" = 429 ]; then
 		repo=${name%%:*}
 		echo "ERROR: unexpected status from HEAD request to https://registry-1.docker.io/v2/library/$repo/manifests/${name#*:}: 429 Too Many Requests" >&2
