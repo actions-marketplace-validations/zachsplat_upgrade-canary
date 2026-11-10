@@ -2,6 +2,8 @@
 
 A scheduled check for container images that build green and then do not start.
 
+What it has caught so far: Wolfi's move to OpenSSL 4 in an unmodified OpenZeppelin Relayer build, a published OpenZeppelin Monitor image whose `node` and `jq` cannot load their libraries (both below), and `node:lts` dropping corepack on Node 26, flagged in the preview before the tag moved. Fixes for breaks of this kind, sent upstream and merged by the maintainers, are listed at [nonceworks.com/fixes.html](https://nonceworks.com/fixes.html?src=gh-canary). If you would rather have this run every week across your organisation's release, publish and nightly workflows, with the fix sent as a pull request, that is the [Nonceworks release pipeline watch](https://nonceworks.com/pricing.html?src=gh-canary).
+
 `canary.sh` builds a Dockerfile the way a fresh release runner would, checks that every executable in the image can load its libraries, starts the image, and tells you which packages moved since the last green run. A preview mode rebuilds on the next value of floating base tags (`node:lts`, `ubuntu:latest`, `python:3`) before the tag moves. It needs Docker with buildx and jq, and ships as a CLI and a composite GitHub Action.
 
 ## What it checks
@@ -207,4 +209,4 @@ Linux, Docker with buildx 0.13 or later and the docker-container driver (and the
 
 MIT, see `LICENSE`.
 
-If you would rather I run it on a schedule for you and send the fix as a pull request: $99 per image a month, or $299 for five. Write to hello@nonceworks.com.
+If you would rather have it run on a schedule for you, with the fix sent as a pull request, see the [release pipeline watch](https://nonceworks.com/pricing.html?src=gh-canary) or write to hello@nonceworks.com.
